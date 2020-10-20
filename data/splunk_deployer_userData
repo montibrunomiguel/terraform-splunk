@@ -1,1 +1,273 @@
 
+#!/bin/bash -v
+sleep 600
+export INSTANCEID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null)
+while STATE=$(aws --no-verify-ssl ec2 describe-instances --region sa-east-1 --filters "Name=tag:Name,Values=Splunk-Master" "Name=instance-state-name,Values=running" --output text --query 'Reservations[*].Instances[*].State.Name'); test "$STATE" != "running"; do
+    sleep 5;
+    echo "Splunk-Master - Aguardando..."
+done;
+echo "Splunk-Master Iniciada"
+aws --no-verify-ssl ec2 describe-instances --region sa-east-1 --filters "Name=tag:Name,Values=Splunk-Master" "Name=instance-state-name,Values=running" --output text --query 'Reservations[*].Instances[*].PrivateIpAddress'
+export MASTER_IP=$(aws --no-verify-ssl ec2 describe-instances --region sa-east-1 --filters "Name=tag:Name,Values=Splunk-Master" | grep -oP '(?<="PrivateIpAddress": ")[^"]*' -m 1)
+export LOCALIP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
+printf '%s\t%s\n' \"$LOCALIP\" 'splunk-shc-deployer' >> /etc/hosts
+hostname splunk-shc-deployer
+export SH_IP=$(aws --no-verify-ssl ec2 describe-instances --region sa-east-1 --filters "Name=tag:Name,Values=Splunk-Search_Head" | grep -oP '(?<="PrivateIpAddress": ")[^"]*' | sort -u)
+export SH_1=$(echo $SH_IP | awk '{print $1}')
+export SH_2=$(echo $SH_IP | awk '{print $2}')
+export SH_3=$(echo $SH_IP | awk '{print $3}')
+export INSTANCE_TYPE=$(aws ec2 describe-instances --instance-id $INSTANCEID --region sa-east-1 --output text --query 'Reservations[*].Instances[*].InstanceType')
+export admin_pass=${admin_password}
+
+sudo cat >>/home/splunk/restaura_search_head.sh<<eof
+
+# Restaura os apps da Search Head
+cd /opt/splunk/
+aws s3 sync s3://${splunk_search_head}/ ./
+
+chown splunk:splunk -R /opt/splunk/
+
+eof
+
+chmod 700 /home/splunk/restaura_search_head.sh
+(crontab -l 2>/dev/null; echo "0 * * * * /home/splunk/restaura_search_head.sh -with args") | crontab -
+
+#Monta o Storage NVME de acordo com o Tipo da Instancia
+
+case $INSTANCE_TYPE in 
+*c5d*) 
+mkdir /data
+sudo mkfs -t xfs /dev/nvme1n1
+sudo blkid /dev/nvme1n1
+UUID=$(sudo blkid /dev/nvme1n1 | grep -Po '(?s)(?<=UUID=").*?(?=")')
+sudo cat >>/etc/fstab <<end
+UUID=$UUID     /data       xfs    defaults,nofail   0   2
+end
+mount -a
+chown splunk:splunk /data
+;;
+*i3*) 
+mkdir /data
+sudo mkfs -t xfs /dev/nvme0n1
+sudo blkid /dev/nvme0n1
+UUID=$(sudo blkid /dev/nvme0n1 | grep -Po '(?s)(?<=UUID=").*?(?=")')
+sudo cat >>/etc/fstab <<end
+UUID=$UUID     /data       xfs    defaults,nofail   0   2
+end
+mount -a
+chown splunk:splunk /data
+;;
+*) echo "Unexpected subnet id";;
+esac
+
+sudo cat >>/home/splunk/splunk_temp.sh<<end1
+
+#!/bin/bash -v
+
+sleep 120
+
+#Monta o Storage NVME de acordo com o Tipo da Instancia
+
+if [ -d "/data" ]
+then
+#Movimentação do SPLUNK_DB
+sudo -u splunk /opt/splunk/bin/splunk stop
+sudo -u splunk cp -R /opt/splunk/var/lib/splunk /data 
+sudo -u splunk rm -Rf /opt/splunk/var/lib/splunk
+sudo -u splunk cat >>/opt/splunk/etc/splunk-launch.conf <<END
+SPLUNK_DB=/data
+END
+sudo -u splunk /opt/splunk/bin/splunk start
+
+echo "Diretorio Movimentado" >> /home/splunk/splunk.log
+
+else
+echo "Diretorio Não Existe" >> /home/splunk/splunk.log
+fi
+
+sleep 60
+
+echo "Alterando Senha de usuario" >> /home/splunk/splunk.log
+
+#Alteração da senha de admin
+
+sudo -u splunk mv /opt/splunk/etc/passwd /opt/splunk/etc/passwd.bak
+sudo -u splunk cat >>/opt/splunk/etc/system/local/user-seed.conf<<end
+[user_info]
+USERNAME = admin
+PASSWORD = $admin_pass
+end
+
+sudo -u splunk  sed -i '/guid/d' /opt/splunk/etc/instance.cfg
+sudo -u splunk touch /opt/splunk/etc/.ui_login
+sudo -u splunk /opt/splunk/bin/splunk edit user admin -password '$admin_pass' -role admin -auth admin:SPLUNK-$INSTANCEID
+
+echo "Senha de usuario Alterada" >> /home/splunk/splunk.log
+
+sudo /opt/splunk/bin/splunk stop
+sleep 60
+
+echo "Adicionando no boot start" >> /home/splunk/splunk.log
+
+sudo /opt/splunk/bin/splunk disable boot-start
+sudo /opt/splunk/bin/splunk enable boot-start -user splunk -systemd-managed 0
+
+echo "Splunk Adicionado no boot start" >> /home/splunk/splunk.log
+
+echo "Alterando ulimit" >> /home/splunk/splunk.log
+
+sed -i '/init.d\/functions/a ulimit -Sn 32768' /etc/init.d/splunk
+sed -i '/init.d\/functions/a ulimit -Hn 65536' /etc/init.d/splunk
+
+sudo cat >>/etc/security/limits.conf<<end
+#splunk
+root        soft    nofile           64000
+root        hard    nofile           64000
+root        hard    nproc            16000
+root        hard    fsize            -1  
+splunk      soft    nofile           64000
+splunk      hard    nofile           64000
+splunk      hard    nproc            16000
+splunk      hard    fsize            -1  
+ 
+end
+
+echo "ulimit Alterado" >> /home/splunk/splunk.log
+
+sudo -u splunk /opt/splunk/bin/splunk restart
+
+echo "restart 1" >> /home/splunk/splunk.log
+
+sleep 120
+
+echo "Alterando informações no web service" >> /home/splunk/splunk.log
+
+#Aumento do tempo de timeout
+touch /opt/splunk/etc/system/local/web.conf
+sudo cat >>/opt/splunk/etc/system/local/web.conf <<end
+[settings]
+splunkdConnectionTimeout = 300
+
+enableWebDebug = True
+
+enableSplunkWebSSL = True
+
+end
+
+chown splunk:splunk /opt/splunk/etc/system/local/web.conf
+
+echo "Web Service Alterado" >> /home/splunk/splunk.log
+
+# Configure some SHC parameters
+
+echo "Alterando parametros no servidor" >> /home/splunk/splunk.log
+
+sudo -u splunk cat >>/opt/splunk/etc/system/local/server.conf <<end
+[shclustering]
+pass4SymmKey = $admin_pass
+shcluster_label = SplunkSHC
+
+end
+
+echo "Parametros Alterador" >> /home/splunk/splunk.log
+
+echo "Desabilitando indexação" >> /home/splunk/splunk.log
+
+touch /opt/splunk/etc/system/local/outputs.conf
+sudo cat >>/opt/splunk/etc/system/local/outputs.conf <<end
+# Turn off indexing on the search head
+[indexAndForward]
+index = false
+
+[tcpout]
+defaultGroup = indexer_cluster_peers
+forwardedindex.filter.disable = true
+indexAndForward = false
+
+[tcpout:indexer_cluster_peers]
+indexerDiscovery = cluster_master
+
+[indexer_discovery:cluster_master]
+pass4SymmKey = $admin_pass
+master_uri = https://$MASTER_IP:8089
+end
+sudo chown -R splunk:splunk /opt/splunk/etc/system/local/outputs.conf
+
+echo "indexação desabilitada" >> /home/splunk/splunk.log
+
+sudo -u splunk mkdir -p /opt/splunk/etc/shcluster/apps/member-base-autogenerated/local
+
+echo "Desabilitando indexação nas SH peers" >> /home/splunk/splunk.log
+
+sudo -u splunk cat >>/opt/splunk/etc/shcluster/apps/member-base-autogenerated/local/outputs.conf <<end
+# Turn off indexing on the search head
+[indexAndForward]
+index = false
+
+[tcpout]
+defaultGroup = indexer_cluster_peers
+forwardedindex.filter.disable = true
+indexAndForward = false
+
+[tcpout:indexer_cluster_peers]
+indexerDiscovery = cluster_master
+
+[indexer_discovery:cluster_master]
+pass4SymmKey = $admin_pass
+master_uri = https://$MASTER_IP:8089
+end
+
+sudo chown -R splunk:splunk /opt/splunk/etc/shcluster/apps
+
+echo "indexação desabilitada" >> /home/splunk/splunk.log
+
+sudo -u splunk /opt/splunk/bin/splunk restart
+
+echo "Restart 2" >> /home/splunk/splunk.log
+
+sleep 120
+
+#Indicação da master
+
+echo "Indicando Master License" >> /home/splunk/splunk.log
+
+sudo -u splunk /opt/splunk/bin/splunk edit licenser-localslave -master_uri https://$MASTER_IP:8089 -auth admin:'$admin_pass'
+
+sudo -u splunk /opt/splunk/bin/splunk apply shcluster-bundle -action stage --answer-yes -auth admin:'$admin_pass'
+
+sudo -u splunk /opt/splunk/bin/splunk restart
+
+echo "Restart 3" >> /home/splunk/splunk.log
+
+#distribuição dos apps
+sleep 600
+
+cd /opt/splunk/
+aws s3 sync s3://${splunk_search_head}/ ./
+
+cd /opt/splunk/etc/shcluster/apps/
+for F in *.tgz; do tar -xvf "\$F"; done &>> /home/splunk/splunk.log
+
+sleep 600
+
+chown -R splunk:splunk -R /opt/splunk/
+
+sudo -u splunk /opt/splunk/bin/splunk apply shcluster-bundle -target https://$SH_1:8089 -auth admin:'$admin_pass' --answer-yes  &>> /home/splunk/splunk.log
+
+echo "Apps Distribuidos" >> /home/splunk/splunk.log
+
+sudo -u splunk /opt/splunk/bin/splunk restart
+
+echo "Restart 4" >> /home/splunk/splunk.log
+
+sleep 120
+
+rm -f /home/splunk/splunk_temp.sh
+
+echo "remoção do splunk_temp" >> /home/splunk/splunk.log
+
+
+end1
+
+chmod 777 /home/splunk/splunk_temp.sh
+at -f /home/splunk/splunk_temp.sh now + 10 minute
