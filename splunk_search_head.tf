@@ -7,7 +7,7 @@ resource "aws_launch_configuration" "splunk_search_head_lc" {
   instance_type               = var.splunk_search_head_instanceTypes[var.environment]
   security_groups             = [aws_security_group.splunk_search_head_sg.id, aws_security_group.splunk_sg.id]
   associate_public_ip_address = false
-  iam_instance_profile        = "cyberdefense-splunk-role"
+  iam_instance_profile        = <iam_name>
 
   user_data = data.template_file.splunk_search_head_userData.rendered
 
