@@ -1,1 +1,49 @@
+data "aws_s3_bucket" "splunk_s3_lambda"{
+  for_each = toset(var.splunk_resource)
+  bucket   = "cyberdefense-splunk-${each.value}-lambda-${var.enviroment}"
+  
+  depends_on = [module.s3]
+}
 
+data "aws_s3_bucket" "splunk_s3"{
+  for_each = toset(var.splunk_resource)
+  bucket   = "cyberdefense-splunk-${each.value}-${var.enviroment}"
+  
+  depends_on = [module.s3]
+}
+
+data "aws_s3_bucket" "splunk_s3_license"{
+  bucket   = "cyberdefense-splunk-license-${var.enviroment}"
+  
+  depends_on = [module.s3]
+}
+
+data "aws_vpc_endpoint" "s3_private_vpc_endpoint"{
+  vpc_id         = var.vpc_id[var.environment]
+  service_name   = "com.amazonaws.sa-east-1.s3"
+}
+
+data "aws_secretsmanager_secret" "splunk_ldap_username"{
+  name = "splunk_ldap_username"
+}
+
+data "aws_secretsmanager_secret_version" "splunk_ldap_username_version"{
+  secret_id = "${data.aws_secretsmanager_secret.splunk_ldap_username.id}"
+}
+
+data "aws_secretsmanager_secret" "splunk_ldap_password" {
+  name = "splunk_ldap_password"
+}
+
+data "aws_secretsmanager_secret_version" "splunk_ldap_password_version"{
+  secret_id = "${data.aws_secretsmanager_secret.splunk_ldap_password.id}"
+}
+
+data "aws_secretsmanager_secret" "splunk_admin_password" {
+  name = "splunk_admin_password"
+}
+
+data "aws_secretsmanager_secret_version" "splunk_admin_password_version"{
+  secret_id = "${data.aws_secretsmanager_secret.splunk_admin_password.id}"
+}
+  
